@@ -264,9 +264,6 @@ struct MatmulL1Reg {
 
 int main(int argc, char **argv) {
     std::string test_data_dir = ".";
-    if (char *c_str_test_data_dir = std::getenv("MATMUL_TEST_DATA_DIR")) {
-        test_data_dir = c_str_test_data_dir;
-    }
 
     auto saved_results = std::vector<BenchmarkResult>();
 
