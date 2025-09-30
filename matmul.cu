@@ -21,6 +21,8 @@ void cuda_check(cudaError_t code, const char *file, int line) {
         cuda_check((x), __FILE__, __LINE__); \
     } while (0)
 
+#define CEIL_DIV(x, y) (((x) + (y)-1) / (y))
+
 ////////////////////////////////////////////////////////////////////////////////
 // CPU Reference Implementation (Too slow to actually run!)
 //
@@ -56,7 +58,16 @@ __global__ void matmul_l1(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your GPU code here */
+    int idx_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx_y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (idx_x < size_j && idx_y < size_i) {
+        float sum = 0.0;
+        for (int32_t k = 0; k < size_k; ++k) {
+            sum += a[idx_y * size_k + k] * b[k * size_j + idx_x];
+        }
+        c[idx_y * size_j + idx_x] = sum;
+    }
 }
 
 void launch_matmul_l1(
@@ -66,7 +77,16 @@ void launch_matmul_l1(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your CPU code here */
+
+    dim3 gridDim = dim3(CEIL_DIV(size_j, 16), CEIL_DIV(size_i, 16));
+    dim3 blockDim = dim3(32, 32);
+    matmul_l1<<<gridDim, blockDim>>>(
+        size_i,
+        size_j,
+        size_k,
+        a,
+        b,
+        c); 
 }
 
 }; // namespace matmul_l1
