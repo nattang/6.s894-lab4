@@ -48,6 +48,8 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 
 ////////////////////////////////////////////////////////////////////////////////
 // GPU Implementation (With Reuse in L1/Shmem)
+#define TILE_X 16
+#define TILE_Y 16
 
 namespace matmul_l1 {
 
@@ -55,19 +57,40 @@ __global__ void matmul_l1(
     int32_t size_i,
     int32_t size_j,
     int32_t size_k,
-    float const *a,
-    float const *b,
+    const float *__restrict__ a, // a and b readonly
+    const float *__restrict__ b,
     float *c) {
+
+    extern __shared__ float scratch[];
+    float (*shmem)[TILE_X] = reinterpret_cast<float (*)[TILE_X]>(scratch);
+
+    float (*A)[TILE_X] = &shmem[0];
+    float (*B)[TILE_X] = &shmem[TILE_Y];
+
     int idx_x = blockIdx.x * blockDim.x + threadIdx.x;
     int idx_y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (idx_x < size_j && idx_y < size_i) {
-        float sum = 0.0;
-        for (int32_t k = 0; k < size_k; ++k) {
-            sum += a[idx_y * size_k + k] * b[k * size_j + idx_x];
+    if (idx_x >= size_j && idx_y >= size_i) {
+        return;
+    }   
+
+    float sum = 0.0; // keep in register
+
+    for (int k = 0; k < size_k; k += TILE_X) {
+        bool in_x_bounds = (k + threadIdx.x) < size_k && idx_y < size_i;
+        bool in_y_bounds = (k + threadIdx.y) < size_k && idx_x < size_j;
+        A[threadIdx.y][threadIdx.x] = a[idx_y * size_k + k + threadIdx.x] * in_x_bounds;
+        B[threadIdx.y][threadIdx.x] = b[(k + threadIdx.y) * size_j + idx_x] * in_y_bounds;
+
+        __syncthreads();
+        // compute
+        for (int32_t tile_i = 0; tile_i < TILE_X; ++tile_i) {
+            sum += A[threadIdx.y][tile_i] * B[tile_j][threadIdx.x];
         }
-        c[idx_y * size_j + idx_x] = sum;
+        __syncthreads();
     }
+
+    c[idx_y * size_j + idx_x] = sum;
 }
 
 void launch_matmul_l1(
@@ -78,9 +101,17 @@ void launch_matmul_l1(
     float const *b,
     float *c) {
 
-    dim3 gridDim = dim3(CEIL_DIV(size_j, 16), CEIL_DIV(size_i, 16));
-    dim3 blockDim = dim3(32, 32);
-    matmul_l1<<<gridDim, blockDim>>>(
+    dim3 gridDim = dim3(CEIL_DIV(size_j, TILE_X), CEIL_DIV(size_i, TILE_Y));
+    dim3 blockDim = dim3(TILE_X, TILE_Y);
+
+    uint32_t shmem_size_bytes = 2 * TILE_X * TILE_Y * sizeof(float);
+
+    CUDA_CHECK(cudaFuncSetAttribute(
+        matmul_l1,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_size_bytes));
+
+    matmul_l1<<<gridDim, blockDim, shmem_size_bytes>>>(
         size_i,
         size_j,
         size_k,
