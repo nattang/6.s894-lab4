@@ -43,13 +43,13 @@ void cuda_check(cudaError_t code, const char *file, int line) {
 //         }
 //     }
 // }
-
 /// <--- your code here --->
 
 ////////////////////////////////////////////////////////////////////////////////
 // GPU Implementation (With Reuse in L1/Shmem)
-#define TILE_X 16
-#define TILE_Y 16
+#define TILE_M 16
+#define TILE_N 16
+#define TILE_K 16
 
 namespace matmul_l1 {
 
@@ -61,36 +61,41 @@ __global__ void matmul_l1(
     const float *__restrict__ b,
     float *c) {
 
-    extern __shared__ float scratch[];
-    float (*shmem)[TILE_X] = reinterpret_cast<float (*)[TILE_X]>(scratch);
+    int thread_col = threadIdx.x; // 0 to TILE_N-1
+    int thread_row = threadIdx.y; // 0 to TILE_M-1
+    int c_i = blockIdx.x * TILE_N + thread_col;
+    int c_j = blockIdx.y * TILE_M + thread_row;
 
-    float (*A)[TILE_X] = &shmem[0];
-    float (*B)[TILE_X] = &shmem[TILE_Y];
-
-    int idx_x = blockIdx.x * blockDim.x + threadIdx.x;
-    int idx_y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (idx_x >= size_j && idx_y >= size_i) {
-        return;
-    }   
-
+    extern __shared__ float shared[];
+    float* A_shared = shared;
+    float* B_shared = shared + TILE_M * TILE_K; // TODO: transpose B
+ 
     float sum = 0.0; // keep in register
+    for (int k = 0; k < size_k; k += TILE_K) {
+        // bounds checks
+        if (c_j < size_j && (k + thread_col) < size_k) {
+            A_shared[thread_row * TILE_K + thread_col] = a[c_j * size_k + (k + thread_col)];
+        } else {
+            A_shared[thread_row * TILE_K + thread_col] = 0.0f;
+        }
 
-    for (int k = 0; k < size_k; k += TILE_X) {
-        bool in_x_bounds = (k + threadIdx.x) < size_k && idx_y < size_i;
-        bool in_y_bounds = (k + threadIdx.y) < size_k && idx_x < size_j;
-        A[threadIdx.y][threadIdx.x] = a[idx_y * size_k + k + threadIdx.x] * in_x_bounds;
-        B[threadIdx.y][threadIdx.x] = b[(k + threadIdx.y) * size_j + idx_x] * in_y_bounds;
-
+        if ((k + thread_row) < size_k && c_i < size_i) {
+            B_shared[thread_row * TILE_N + thread_col] = b[(k + thread_row) * size_i + c_i];
+        } else {
+            B_shared[thread_row * TILE_N + thread_col] = 0.0f;
+        }
+        
         __syncthreads();
         // compute
-        for (int32_t tile_i = 0; tile_i < TILE_X; ++tile_i) {
-            sum += A[threadIdx.y][tile_i] * B[tile_j][threadIdx.x];
+        for (int32_t tile_i = 0; tile_i < TILE_K; ++tile_i) {
+            sum += A_shared[thread_row * TILE_K + tile_i] * B_shared[tile_i * TILE_N + thread_col];
         }
         __syncthreads();
     }
 
-    c[idx_y * size_j + idx_x] = sum;
+    if (c_i < size_i && c_j < size_j) {
+        c[c_j * size_i + c_i] = sum;
+    }
 }
 
 void launch_matmul_l1(
@@ -101,11 +106,11 @@ void launch_matmul_l1(
     float const *b,
     float *c) {
 
-    dim3 gridDim = dim3(CEIL_DIV(size_j, TILE_X), CEIL_DIV(size_i, TILE_Y));
-    dim3 blockDim = dim3(TILE_X, TILE_Y);
+    dim3 gridDim = dim3(CEIL_DIV(size_j, TILE_N), CEIL_DIV(size_i, TILE_M));
+    dim3 blockDim = dim3(TILE_N, TILE_M);
 
-    uint32_t shmem_size_bytes = 2 * TILE_X * TILE_Y * sizeof(float);
-
+    uint32_t shmem_size_bytes = (TILE_M * TILE_K * sizeof(float)) + (TILE_K * TILE_N * sizeof(float));
+    // printf("shem_size in KB: %u\n", shmem_size_bytes / 1000);
     CUDA_CHECK(cudaFuncSetAttribute(
         matmul_l1,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -125,17 +130,97 @@ void launch_matmul_l1(
 ////////////////////////////////////////////////////////////////////////////////
 // GPU Implementation (With Reuse in L1/Shmem and Registers)
 
+#define MICRO_TILE 4
+
 namespace matmul_l1_reg {
 
-__global__ void matmul_l1_reg(
+__global__ void 
+__launch_bounds__(TILE_M * TILE_N)
+matmul_l1_reg(
     int32_t size_i,
     int32_t size_j,
     int32_t size_k,
     float const *a,
     float const *b,
-    float *c) {
-    /* TODO: your GPU code here */
+    float *c) 
+{
+    int thread_col = threadIdx.x; // 0 to TILE_N-1
+    int thread_row = threadIdx.y; // 0 to TILE_M-1    
+
+    int c_i_start  = blockIdx.x * TILE_N * MICRO_TILE + thread_col * MICRO_TILE; 
+    int c_i_end = min(c_i_start + MICRO_TILE, size_j);
+    int c_j_start  = blockIdx.y * TILE_M * MICRO_TILE + thread_row * MICRO_TILE;
+    int c_j_end = min(c_j_start + MICRO_TILE, size_i);
+
+    extern __shared__ float shared[];
+    float* A_shared = shared; // [TILE_M * MICRO_TILE][TILE_K]
+    float* B_shared = A_shared + (TILE_M * MICRO_TILE) * TILE_K; // [TILE_K][TILE_N * MICRO_TILE]
+
+    float c_reg[MICRO_TILE][MICRO_TILE] = {0}; // store partial sum of c in registers
+    float a_reg[MICRO_TILE]; 
+    float b_reg[MICRO_TILE];
+
+    for (int tile_k = 0; tile_k < size_k; tile_k += TILE_K) {
+        int a_col = tile_k + thread_col;
+        // load MICRO_TILE col from A
+        for (int m = 0; m < MICRO_TILE; ++m) {
+            int a_row = c_j_start + m; 
+            // int a_col = tile_k + thread_col;
+            int shmem_idx = (thread_row * MICRO_TILE + m) * TILE_K + thread_col;
+            if (a_row < size_i && a_col < size_k) {
+                A_shared[shmem_idx] = a[a_row * size_k + a_col];
+            } else {
+                A_shared[shmem_idx] = 0.0f;
+            }
+        }
+
+        // load MICRO_TILE row from B
+        for (int n = 0; n < MICRO_TILE; ++n) {
+            int b_row = tile_k + thread_row;
+            int b_col = c_i_start + n;
+            int smem_idx =
+                thread_row * (TILE_N * MICRO_TILE) + thread_col * MICRO_TILE + n;
+            if (b_row < size_k && b_col < size_j) {
+                B_shared[smem_idx] = b[b_row * size_j + b_col];
+            } else {
+                B_shared[smem_idx] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        // compute
+        for (int tile_k = 0; tile_k < TILE_K; ++tile_k) {
+            for (int m = 0; m < MICRO_TILE; ++m) {
+                a_reg[m] = A_shared[(thread_row * MICRO_TILE + m) * TILE_K + tile_k];
+            }
+
+            for (int n = 0; n < MICRO_TILE; ++n) {
+                b_reg[n] = B_shared[tile_k * (TILE_N * MICRO_TILE) + thread_col * MICRO_TILE + n];
+            }
+
+            for (int m = 0; m < MICRO_TILE; ++m) {
+                for (int n = 0; n < MICRO_TILE; ++n) {
+                    c_reg[m][n] += a_reg[m] * b_reg[n];
+                }
+            }
+        }
+
+        __syncthreads(); 
+    }
+
+    // write back to c
+    for (int m = 0; m < MICRO_TILE; ++m) {
+        for (int n = 0; n < MICRO_TILE; ++n) {
+            int row = c_j_start + m;
+            int col = c_i_start + n;
+            if (row < size_i && col < size_j) {
+                c[row * size_j + col] = c_reg[m][n];
+            }
+        }
+    }
 }
+
+
 
 void launch_matmul_l1_reg(
     int32_t size_i,
@@ -144,7 +229,24 @@ void launch_matmul_l1_reg(
     float const *a,
     float const *b,
     float *c) {
-    /* TODO: your CPU code here */
+
+    dim3 gridDim = dim3(CEIL_DIV(size_j, TILE_N * MICRO_TILE), CEIL_DIV(size_i, TILE_M * MICRO_TILE));
+    dim3 blockDim = dim3(TILE_N, TILE_M);
+
+    uint32_t shmem_size_bytes = 2 * TILE_M * TILE_N * MICRO_TILE * MICRO_TILE * sizeof(float);
+
+    CUDA_CHECK(cudaFuncSetAttribute(
+        matmul_l1_reg,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        shmem_size_bytes));
+
+    matmul_l1_reg<<<gridDim, blockDim, shmem_size_bytes>>>(
+        size_i,
+        size_j,
+        size_k,
+        a,
+        b,
+        c); 
 }
 
 }; // namespace matmul_l1_reg
